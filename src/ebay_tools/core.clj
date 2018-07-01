@@ -131,6 +131,16 @@
         (when-not (zip/end? zip)
           (recur more))))))
 
+(defn find-elements [zip tag]
+  (loop [zip zip
+         result []]
+    (if (zip/end? zip)
+      result
+      (recur (zip/next zip)
+             (if (= (-> zip zip/node :tag) tag)
+               (conj result (zip/node zip))
+               result)))))
+
 (defn get-blocked-bidders []
   (-> (ebay-html-request :get "BidderBlockLogin" {})
       hickory-zip
@@ -171,3 +181,24 @@
                                         "buyeruserid" user-id
                                         "info" "Artikelbeschreibung nicht gelesen oder nicht verstanden"}})
       (get-h1-content)))
+
+(defn block-and-cancel-bid [{:keys [description item-id user-id]}]
+  (println "Cancel bid from" user-id "for" description "-" (cancel-bid item-id user-id))
+  (println "Blocking bidder" user-id "-" (block-bidder user-id)))
+
+(defn block-and-cancel []
+  (doseq [bid (blockable-bids)]
+    (block-and-cancel-bid bid)))
+
+(defn get-inputs [body]
+  (-> body
+      hickory-zip
+      (find-elements :input)))
+
+(defn get-login-page-parameters []
+  (->> (ebay-html-request :get "SignIn" {})
+       (get-inputs)
+       (map :attrs)
+       (remove #(empty? (:value %)))
+       (map #(vector (:name %) (:value %)))
+       (into {})))
