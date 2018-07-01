@@ -16,6 +16,7 @@
 (xml/alias-uri 'ebay "urn:ebay:apis:eBLBaseComponents")
 
 (def credentials (edn/read-string (slurp "credentials.edn")))
+(def cookie-store (clj-http.cookies/cookie-store))
 
 (defn add-token [[element & children]]
   `[~element
@@ -28,6 +29,24 @@
       (add-token)
       (xml/sexp-as-element)
       (xml/indent-str)))
+
+(defn find-element [zip tag]
+  (loop [zip zip]
+    (if (= (-> zip zip/node :tag) tag)
+      (zip/node zip)
+      (let [more (zip/next zip)]
+        (when-not (zip/end? zip)
+          (recur more))))))
+
+(defn find-elements [zip tag]
+  (loop [zip zip
+         result []]
+    (if (zip/end? zip)
+      result
+      (recur (zip/next zip)
+             (if (= (-> zip zip/node :tag) tag)
+               (conj result (zip/node zip))
+               result)))))
 
 (defn ebay-api-request [api-call-name xml]
   (let [xml (-> (http/request {:method :post
@@ -108,38 +127,91 @@
        (map high-bidder-status)
        (remove acceptable-bidder?)))
 
-(defn ebay-web-request [method api-name request]
-  (let [{:keys [status headers body]} (http/request (merge {:method method
-                                                            :url (str "https://offer.ebay.de/ws/eBayISAPI.dll?" api-name)
-                                                            :headers {"Cookie" (:cookie credentials)}}
-                                                           request))]
-    (if (= status 200)
-      body
-      (throw (ex-info "Unexpected status response from ebay"
+(defn get-inputs [body]
+  (-> body
+      hickory-zip
+      (find-elements :input)))
+
+(defn get-page-input-values [hickory]
+  (->> hickory
+       (get-inputs)
+       (map :attrs)
+       (remove #(empty? (:value %)))
+       (map #(vector (:name %) (:value %)))
+       (into {})))
+
+(defn send-login [page-parameters userid pass]
+  (let [{:keys [status headers body trace-redirects]} (http/request {:method :post
+                                                                     :url "https://www.ebay.de/signin/s"
+                                                                     :cookie-policy :standard
+                                                                     :cookie-store cookie-store
+                                                                     :trace-redirects true
+                                                                     :form-params (assoc page-parameters
+                                                                                         :userid userid
+                                                                                         :pass pass)})]
+    (if (= status 302)
+      (get headers "Location")
+      (throw (ex-info "Could not log in to eBay"
                       {:status status :body body})))))
+
+(defn log-in [login-page-parameters expected-redirection]
+  (let [redirected-to (send-login login-page-parameters (:userid credentials) (:pass credentials))]
+    (when-not (string/starts-with? redirected-to expected-redirection)
+      (throw (ex-info "eBay redirected us to unexpected URL after login"
+                      {:expected-redirection expected-redirection
+                       :redirected-to redirected-to})))))
+
+(defn ebay-web-request* [method api-name request try-logging-in?]
+  (let [url (str "https://offer.ebay.de/ws/eBayISAPI.dll?" api-name)
+        {:keys [status headers body trace-redirects]} (http/request (merge {:method method
+                                                                            :url url
+                                                                            :cookie-policy :standard
+                                                                            :cookie-store cookie-store
+                                                                            :trace-redirects true}
+                                                                           request))]
+    (if (seq trace-redirects)
+      (if try-logging-in?
+        (if (re-find #"^https://signin\.ebay\.de/ws/eBayISAPI\.dll" (first trace-redirects))
+          (do (log-in (-> body
+                          hickory/parse
+                          hickory/as-hickory
+                          get-page-input-values)
+                      url)
+              (ebay-web-request* method api-name request false))
+          (throw (ex-info "Unexpected redirect from eBay"
+                          {:trace-redirects trace-redirects})))
+        (throw (ex-info "Unexpected redirect from eBay after allegedly successful login"
+                        {:trace-redirects trace-redirects})))
+      (if (= status 200)
+        body
+        (throw (ex-info "Unexpected status response from ebay"
+                        {:status status :body body}))))))
+
+(defn ebay-web-request [method api-name request]
+  (ebay-web-request* method api-name request true))
+
+(def saved-srt (atom nil))
+(def saved-stok (atom nil))
+
+(defn save-srt-and-stok
+  "srt and stok are hidden parameters that are required by some of
+  eBay's POST handlers.  They are set by hidden parameters and this
+  function saves them when they're seen"
+  [hickory]
+  (let [input-values (get-page-input-values hickory)
+        srt (get input-values "srt")
+        stok (get input-values "stok")]
+    (when srt
+      (reset! saved-srt srt))
+    (when stok
+      (reset! saved-stok stok)))
+  hickory)
 
 (defn ebay-html-request [method api-name request]
   (-> (ebay-web-request method api-name request)
       hickory/parse
-      hickory/as-hickory))
-
-(defn find-element [zip tag]
-  (loop [zip zip]
-    (if (= (-> zip zip/node :tag) tag)
-      (zip/node zip)
-      (let [more (zip/next zip)]
-        (when-not (zip/end? zip)
-          (recur more))))))
-
-(defn find-elements [zip tag]
-  (loop [zip zip
-         result []]
-    (if (zip/end? zip)
-      result
-      (recur (zip/next zip)
-             (if (= (-> zip zip/node :tag) tag)
-               (conj result (zip/node zip))
-               result)))))
+      hickory/as-hickory
+      (save-srt-and-stok)))
 
 (defn get-blocked-bidders []
   (-> (ebay-html-request :get "BidderBlockLogin" {})
@@ -161,8 +233,8 @@
   (-> (ebay-html-request :post "BidderBlockResult"
                          {:form-params {"MfcISAPICommand" "BidderBlockResult"
                                         "userid" (:userid credentials)
-                                        "stok" (:stok credentials)
-                                        "srt" (:srt credentials)
+                                        "stok" @saved-stok
+                                        "srt" @saved-srt
                                         "bidderlist" (string/join ", " user-ids)}})
       (get-h1-content)))
 
@@ -176,7 +248,7 @@
   (-> (ebay-html-request :post "CancelBid"
                          {:form-params {"MfcISAPICommand" "CancelBid"
                                         "selleruserid" (:userid credentials)
-                                        "stok" (:stok credentials)
+                                        "stok" @saved-stok
                                         "item" item-id
                                         "buyeruserid" user-id
                                         "info" "Artikelbeschreibung nicht gelesen oder nicht verstanden"}})
@@ -189,16 +261,3 @@
 (defn block-and-cancel []
   (doseq [bid (blockable-bids)]
     (block-and-cancel-bid bid)))
-
-(defn get-inputs [body]
-  (-> body
-      hickory-zip
-      (find-elements :input)))
-
-(defn get-login-page-parameters []
-  (->> (ebay-html-request :get "SignIn" {})
-       (get-inputs)
-       (map :attrs)
-       (remove #(empty? (:value %)))
-       (map #(vector (:name %) (:value %)))
-       (into {})))
