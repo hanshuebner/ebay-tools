@@ -190,14 +190,15 @@
 (defn ebay-web-request [method api-name request]
   (ebay-web-request* method api-name request true))
 
+;; srt and stok are parameters that are required by some of eBay's
+;; POST handlers.  They are set by hidden parameters and which are
+;; saved by save-srt-and-stok below when they're seen in a response
+;; page from ebay.
+
 (def saved-srt (atom nil))
 (def saved-stok (atom nil))
 
-(defn save-srt-and-stok
-  "srt and stok are hidden parameters that are required by some of
-  eBay's POST handlers.  They are set by hidden parameters and this
-  function saves them when they're seen"
-  [hickory]
+(defn save-srt-and-stok [hickory]
   (let [input-values (get-page-input-values hickory)
         srt (get input-values "srt")
         stok (get input-values "stok")]
