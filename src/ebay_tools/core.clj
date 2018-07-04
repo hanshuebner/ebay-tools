@@ -185,7 +185,9 @@
       (if (= status 200)
         body
         (throw (ex-info "Unexpected status response from ebay"
-                        {:status status :body body}))))))
+                        {:status status
+                         :headers headers
+                         :body body}))))))
 
 (defn ebay-web-request [method api-name request]
   (ebay-web-request* method api-name request true))
@@ -256,9 +258,15 @@
       (get-h1-content)))
 
 (defn block-and-cancel-bid [{:keys [description item-id user-id]}]
-  (println "Cancel bid from" user-id "for" description "-" (cancel-bid item-id user-id))
-  (println "Blocking bidder" user-id "-" (block-bidder user-id)))
+  (println "Blocking bidder" user-id "-" (block-bidder user-id))
+  (println "Cancel bid from" user-id "for" description "-" (cancel-bid item-id user-id)))
 
 (defn block-and-cancel []
   (doseq [bid (blockable-bids)]
     (block-and-cancel-bid bid)))
+
+(defn run []
+  (while true
+    (println (format-time (time/now)) "checking")
+    (block-and-cancel)
+    (java.lang.Thread/sleep 60000)))
